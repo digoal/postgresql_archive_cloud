@@ -1,0 +1,441 @@
+一、概览
+PostgreSQL 归档调度系统
+# 组件:
+1. 调度数据库
+   -- 存储被备份库的指纹信息,云存储路径,备份库与路径对应关系,开关状态,备份日志,删除日志等.
+2. 存储服务器
+   -- 存储备份数据
+3. 客户机PostgreSQL数据库
+   -- 存储指纹信息,WAL大小信息等不会变化的信息.
+4. nagios监控脚本
+   -- 监控客户机或调度数据库,存储等.
+
+
+二、配置-常规配置 : 
+1. 存储服务器 的iptables配置,允许本案例所需要的连接.
+  允许客户机连接存储服务器的ssh监听端口.
+配置略 : vi /etc/sysconfig/iptables
+
+2. 客户机 的PostgreSQL数据库服务器配置 : 
+   -- 快速SSH连接
+su - root
+vi /etc/ssh/ssh_config
+	GSSAPIAuthentication no
+   -- 给nagios监控状态文件准备目录权限
+chmod 777 /tmp
+   -- 生成OS的postgres数据库启动用户的公钥私钥
+su - postgres
+ssh-keygen -t dsa
+ssh-keygen -t rsa
+chmod 700 ~
+chmod 700 ~/.ssh
+chmod 400 ~/.ssh/id_*
+chmod 600 ~/.ssh/known_hosts
+# 以上为集群中所有服务器都需要的配置(假设使用RHCS集群)
+
+   -- 修改指纹信息数据库本地登录无需验证,放在所有验证条目的前面
+vi $PGDATA/pg_hba.conf
+host fingerprint fingerprint 127.0.0.1/32 trust
+pg_ctl reload
+   -- 新建指纹信息数据库,对象,表,插入初始化数据
+psql -h 127.0.0.1 postgres postgres
+create role fingerprint nosuperuser nocreatedb nocreaterole noinherit login encrypted password 'fingerprint密码略';
+create database fingerprint with owner fingerprint template template0 encoding 'UTF8' ;
+\c fingerprint fingerprint
+create schema fingerprint authorization fingerprint;
+create table fingerprint (id int ,uuid text not null,wal_size_mb bigint not null,create_time timestamp without time zone,primary key (id));
+\q
+
+# 以下为RHCS集群中所有服务器都需要的配置
+   -- 新建OS postgres数据库启动用户的归档脚本目录,日志目录,修改权限
+su - postgres
+mkdir -p ~/arch_script/log
+chmod -R 700 ~/arch_script
+   -- 拷贝pg_archive.sh脚本(归档接口程序)至 ~/arch_script/
+   -- 新建~/arch_script/pgpass 存放连接调度数据库和本地数据库的用户密码
+vi ~/arch_script/pgpass
+调度库IP:调度库端口:调度库名:调度库用户:调度库用户密码
+127.0.0.1:5432:fingerprint:fingerprint:fingerprint密码略
+
+   -- 拷贝OS postgres用户(即数据库的启动用户, 下面以postgres用户为例)配置文件至pg_archive9.0.conf的最前端(包含psql执行路径),修改权限
+su - postgres
+cat ~/.bash_profile 至 pg_archive9.0.conf的最前端, 接下面放个性化配置.
+chmod 500 ~/arch_script/*
+chmod 400 ~/arch_script/pgpass
+chmod 700 ~/arch_script/log
+
+3. 归档文件用到的存储服务器配置 : 
+   -- 配置sshd,允许密钥认证.
+su - root
+vi /etc/ssh/sshd_config
+PubkeyAuthentication yes
+UseDNS no
+service sshd restart
+   -- 新建归档远程连接用户,生成ssh密钥认证目录及文件(客户机上面PostgreSQL数据库启动用户的公钥将拷贝到这些文件中).
+useradd arch
+passwd arch
+su - arch
+mkdir ~/.ssh
+chmod 700 ~/.ssh
+touch ~/.ssh/authorized_keys
+chmod 400 ~/.ssh/authorized_keys
+
+4. 调度数据库配置 : 
+   -- 新建调度数据库,用户,表空间,客户机数据库信息表,存储路径表,对应关系表,日志表等.
+su - postgres
+psql -h 127.0.0.1 postgres postgres
+create role arch nosuperuser login encrypted password '密码略';
+create tablespace tbs_arch owner arch location '地址略';
+create database arch with owner arch template template0 encoding='UTF8' tablespace tbs_arch;
+\c arch arch
+create schema arch authorization arch;
+create table arch_db_info (id uuid,idc text,platform text,software text,version text,vip inet,port int,switch text,create_time timestamp without time zone,modify_time timestamp without time zone,active_status boolean,alias text not null,primary key (id));
+create unique index uk_db_info_1 on arch_db_info (idc,vip,port);
+create unique index uk_db_info_2 on arch_db_info (alias);
+
+create table arch_path_info (id int,ssh_ip inet,ssh_port int,ssh_user text,root_path text,create_time timestamp without time zone,modify_time timestamp without time zone,active_status boolean,size_mb bigint,primary key (id));
+create unique index uk_path_info_1 on arch_path_info (ssh_ip,ssh_port,root_path);
+
+create table arch_path_map (id int,db_id uuid,path_id int,priority int,active_status boolean,create_time timestamp without time zone,modify_time timestamp without time zone,primary key (id));
+create unique index uk_path_map_1 on arch_path_map (db_id,path_id);
+alter table arch_path_map add constraint fk_path_1 foreign key (db_id) references arch_db_info(id);
+alter table arch_path_map add constraint fk_path_2 foreign key (path_id) references arch_path_info(id);
+
+create table arch_remote_log (db_id uuid,ssh_ip inet,ssh_port int,ssh_user text,full_path text,wal_size_mb bigint,create_time timestamp without time zone,status boolean,delete boolean);
+
+create table arch_local_log (db_id uuid,full_path text,wal_size_mb bigint,create_time timestamp without time zone,status boolean,delete boolean);
+\q
+
+
+二、配置-非常规配置 : 
+1. 客户机PostgreSQL数据库服务器配置1 : 
+   -- 产生指纹,插入本地指纹信息, WAL文件标准大小.
+su - postgres
+# 使用linux命令获取UUID
+uuidgen
+psql -h 127.0.0.1 fingerprint fingerprint
+# 获取WAL文件标准大小
+select t1.setting*t2.setting/1024/1024 from (select setting::int from pg_settings where name='wal_block_size') t1,(select setting::int from pg_settings where name='wal_segment_size') t2;
+insert into fingerprint(id,uuid,wal_size_mb,create_time) values (1, $获取的UUID, $获取的WAL文件标准大小, now());
+commit;
+
+2. 归档存储服务器配置举例 : 
+   -- 新建目录,挂载存储,配置多路径,格式化文件系统,挂载,修改文件系统权限
+su - root
+mkdir /sto1_dg1_part1
+mkdir /sto1_dg2_part1
+mkdir /sto1_dg2_part2
+mkdir /sto1_dg2_part3
+mkdir /sto1_dg2_part4
+mkdir /sto1_dg3_part1
+mkdir /sto1_dg3_part2
+mkdir /sto1_dg3_part3
+mkdir /sto1_dg3_part4
+pvcreate
+vgcreate
+lvcreate
+mkfs.ext4
+vi /etc/fstab
+/dev/mapper/vg01-lv01   /sto1_dg1_part1                 ext4    defaults,noatime 0 0
+/dev/mapper/vg02-lv01   /sto1_dg2_part1                 ext4    defaults,noatime 0 0
+/dev/mapper/vg02-lv02   /sto1_dg2_part2                 ext4    defaults,noatime 0 0
+/dev/mapper/vg02-lv03   /sto1_dg2_part3                 ext4    defaults,noatime 0 0
+/dev/mapper/vg02-lv04   /sto1_dg2_part4                 ext4    defaults,noatime 0 0
+/dev/mapper/vg03-lv01   /sto1_dg3_part1                 ext4    defaults,noatime 0 0
+/dev/mapper/vg03-lv02   /sto1_dg3_part2                 ext4    defaults,noatime 0 0
+/dev/mapper/vg03-lv03   /sto1_dg3_part3                 ext4    defaults,noatime 0 0
+/dev/mapper/vg03-lv04   /sto1_dg3_part4                 ext4    defaults,noatime 0 0
+
+mount -a
+mkdir /sto1_dg1_part1/archive
+chown -R arch:arch /sto1_dg1_part1/archive
+chmod -R 700 /sto1_dg1_part1/archive
+# 其他几个目录也如图以上操作.
+.....................
+
+   -- 拷贝客户PostgreSQL服务器公钥至所有归档数据库存储服务器相关用户下.
+su - arch
+vi ~/.ssh/authorized_keys
+# 拷贝客户端PostgreSQL数据库服务器postgres用户(PostgreSQL数据库的启动用户)公钥内容至此文件
+# 客户端是RHCS的都需要操作一遍, 否则数据库切换后归档到远程服务器将不成功.
+
+
+3. 调度数据库配置 : 
+   -- 插入指纹数据库信息,路径信息,路径映射,配置路径开关,客户机归档开关等
+psql -h 127.0.0.1 arch arch
+insert into arch_db_info (id,idc,platform,software,version,vip,port,create_time,active_status,switch,alias) values ('09e9f16f-ad78-4c89-bedd-37aab5477d68','HangZhouSanDun','x86_64','PostgreSQL','9.0.4','192.168.1.100',5432,now(),'true','start','DIGOAL_TESTDB');
+
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (1,'192.168.1.61',22,'arch','/sto1_dg1_part1/archive/',now(),'true');
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (2,'192.168.1.61',22,'arch','/sto1_dg2_part1/archive/',now(),'true');
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (3,'192.168.1.61',22,'arch','/sto1_dg2_part2/archive/',now(),'true');
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (4,'192.168.1.61',22,'arch','/sto1_dg2_part3/archive/',now(),'true');
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (5,'192.168.1.61',22,'arch','/sto1_dg2_part4/archive/',now(),'true');
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (6,'192.168.1.61',22,'arch','/sto1_dg3_part1/archive/',now(),'true');
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (7,'192.168.1.61',22,'arch','/sto1_dg3_part2/archive/',now(),'true');
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (8,'192.168.1.61',22,'arch','/sto1_dg3_part3/archive/',now(),'true');
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (9,'192.168.1.61',22,'arch','/sto1_dg3_part4/archive/',now(),'true');
+
+insert into arch_path_map (id,db_id,path_id,priority,active_status,create_time) values (1,'09e9f16f-ad78-4c89-bedd-37aab5477d68',2,2,'true',now());
+insert into arch_path_map (id,db_id,path_id,priority,active_status,create_time) values (2,'09e9f16f-ad78-4c89-bedd-37aab5477d68',5,1,'true',now());
+
+
+
+4. 客户机PostgreSQL数据库服务器配置2 : 
+   -- 完成第一次无密码认证.
+   # 确保无需密码
+   # 客户端是RHCS的都需要操作一遍
+su - postgres
+ssh -p $port $user@$归档服务器 date
+
+   -- 配置arch_script的conf文件
+vi ~/arch_script/pg_archive9.0.conf  (分两部分内容)
+#!/bin/bash
+# 1. 添加~/.bash_profile的内容到这里, psql必须包含在PATH中, 如下
+export LANG=en_US.utf8
+export PGHOME=/opt/pgsql
+export LD_LIBRARY_PATH=$PGHOME/lib:/lib64:/usr/lib64:/usr/local/lib64:/lib:/usr/lib:/usr/local/lib
+export DATE=`date +"%Y%m%d%H%M"`
+export PATH=$PGHOME/bin:$PATH:.
+
+# 2. 以下是定制化配置
+# 自定义变量
+export PGPASSFILE=~/arch_script/pgpass
+CONTROL_DB_IP=192.168.1.61
+CONTROL_DB_PORT=5432
+CONTROL_DB_USER=arch
+CONTROL_DB_NAME=arch
+CONTROL_DB_SCHEMA=arch
+LOC_DB_IP=127.0.0.1
+LOC_DB_PORT=5432
+LOC_DB_USER=fingerprint
+LOC_DB_NAME=fingerprint
+LOC_DB_SCHEMA=fingerprint
+LOC_ARCH_DIR=/opt/pg_archive/
+LOC_PGDATA=/database/pgdata/5432/pg_root/
+NAGIOS=on
+NAGIOS_RESULT_FILE=/tmp/pgarchive.nagios_5432
+# 配置实例讲解
+# bash_profile来自postgres用户
+# -- PGPASSFILE 连接调度数据库的密码文件
+# -- 以下信息是本地连接调度数据库的信息,如
+# CONTROL_DB_IP=172.16.3.176
+# CONTROL_DB_PORT=5432
+# CONTROL_DB_USER=arch
+# CONTROL_DB_NAME=arch
+# CONTROL_DB_SCHEMA=arch
+# -- 以下信息用于连接到本地库读取本地库的指纹信息和wal_size_mb,如
+# LOC_DB_IP=127.0.0.1
+# LOC_DB_PORT=5432
+# LOC_DB_USER=fingerprint
+# LOC_DB_NAME=fingerprint
+# LOC_DB_SCHEMA=fingerprint
+# -- 配置目录时必须注意反斜线是否需要加上,如
+# LOC_ARCH_DIR=/opt/pg_archive/ 本地归档目录
+# LOC_PGDATA=/database/pgdata/5432/pg_root/ 本地数据库目录
+# NAGIOS 控制是否开启写nagios通讯文件的功能,on/off
+# NAGIOS_RESULT_FILE 输出消息到通讯文件,status=0,success表示成功,其他表示失败
+
+
+   -- 配置归档脚本pg_archive9.0.sh
+   略, 见src
+      chmod 500 pg_archive9.0.sh
+
+   -- 配置本地归档目录, RHCS集群环境都要配置, 当远程路径归档不成功时, 使用本地归档.
+# 如果不希望归档写到本地, 把本地归档目录权限设置为400即可; chmod 400 /opt/pg_archive
+su - root
+mkdir /opt/pg_archive
+chown postgres:postgres /opt/pg_archive
+chmod 700 /opt/pg_archive
+
+# 配置客户机数据库参数.
+su - postgres
+vi $PGDATA/postgresql.conf
+wal_level = hot_standby
+archive_mode = on
+archive_command = '. ~/arch_script/pg_archive.sh %p %f'
+pg_ctl reload
+
+
+
+# 特别注意客户端如果是RHCS集群环境
+# 本例中归档存储和归档调度数据库不使用RHCS集群, 简化配置.
+
+
+三、
+   -- # 新增客户机数据库服务器, 把其他数据库添加到调度数据库服务器的metadata中.
+insert into arch_db_info (id,idc,platform,software,version,vip,port,create_time,active_status,switch,alias) values ('a4e141c9-50d6-494c-b725-ae1f237897b2','HangZhouSanDun','x86_64','PostgreSQL','9.0.1','192.168.1.164','5432',now(),'true','start','sns');
+insert into arch_db_info (id,idc,platform,software,version,vip,port,create_time,active_status,switch,alias) values ('bea17322-2c15-49b2-bc49-4d7ff4a795ee','HangZhouSanDun','x86_64','PostgreSQL','9.0.1','192.168.1.167','5432',now(),'true','start','lbs');
+insert into arch_db_info (id,idc,platform,software,version,vip,port,create_time,active_status,switch,alias) values ('c90d8f09-2cc4-4ade-8112-780c72dd224b','HangZhouSanDun','x86_64','PostgreSQL','9.0.1','192.168.1.138','5432',now(),'true','start','skyurs1');
+insert into arch_db_info (id,idc,platform,software,version,vip,port,create_time,active_status,switch,alias) values ('a80d2831-3573-4ce2-bf6c-96a187f625ee','HangZhouSanDun','x86_64','PostgreSQL','9.0.1','192.168.1.139','5432',now(),'true','start','skyurs2');
+insert into arch_db_info (id,idc,platform,software,version,vip,port,create_time,active_status,switch,alias) values ('12fcdd6d-24da-4ca8-99a8-b67242c33f18','HangZhouSanDun','x86_64','PostgreSQL','9.0.1','192.168.1.159','5432',now(),'true','start','skyurs3');
+insert into arch_db_info (id,idc,platform,software,version,vip,port,create_time,active_status,switch,alias) values ('8cf59ff9-aa4c-4787-a51f-c1fb7d3f6827','HangZhouSanDun','x86_64','PostgreSQL','9.0.1','192.168.1.160','5432',now(),'true','start','skyurs4');
+insert into arch_db_info (id,idc,platform,software,version,vip,port,create_time,active_status,switch,alias) values ('76598e77-8423-473c-a6e0-b36cfd0158de','HangZhouSanDun','x86_64','PostgreSQL','8.4.4','192.168.1.142','5432',now(),'true','start','usproxy');
+insert into arch_db_info (id,idc,platform,software,version,vip,port,create_time,active_status,switch,alias) values ('fa129604-bf86-4f8d-a91e-e42a7854fbeb','HangZhouSanDun','x86_64','PostgreSQL','8.4.4','192.168.1.141','5432',now(),'true','start','uims');
+insert into arch_db_info (id,idc,platform,software,version,vip,port,create_time,active_status,switch,alias) values ('09b18cf0-5b85-4bc6-8ac8-548a360bd056','HangZhouSanDun','x86_64','PostgreSQL','9.0.0','192.168.1.133','5432',now(),'true','start','gamehall');
+insert into arch_db_info (id,idc,platform,software,version,vip,port,create_time,active_status,switch,alias) values ('63e4c28b-7725-49dc-b533-dd3df58ad7e7','HangZhouSanDun','x86_64','PostgreSQL','9.0.0','192.168.1.152','5432',now(),'true','start','community');
+
+
+
+
+
+
+
+
+
+
+
+
+
+四、
+   -- 输出报告用到的SQL, 每天输出一封邮件, 内容包含加入到调度系统的数据库客户机的信息, 云存储的使用状态, 周状态, 异常信息, 本地归档信息.
+1. Cloud Storage Status:
+select t3.cloud_nodes,round(t1.size_gb,0) CLOUD_STORAGE_SIZE_GB,round(t2.size_gb) USED_GB,trunc((t2.size_gb/t1.size_gb)*100,2)||'%' USED_RATIO from (select sum(size_mb)/1024 size_gb from arch_path_info) t1,(select sum(wal_size_mb)/1024 size_gb from arch_remote_log) t2,(select count(*) cloud_nodes from arch_path_info) t3 ;
+
+2. Database Info:
+select idc,alias,software,version,vip,port,active_status,switch from arch_db_info;
+
+3. Weekly Status:
+select date(create_time),round(sum(wal_size_mb)/1024) size_gb from arch_remote_log where create_time >= current_date-7 and create_time<current_date group by date(create_time);
+
+4. Cloud Storage Abnormal Info:
+select db_id,ssh_ip,ssh_port,ssh_user,wal_size_mb,create_time,full_path from arch_remote_log where create_time>=current_date-1 and status is false order by create_time;
+
+5. Local Info:
+select db_id,wal_size_mb,create_time,status,full_path from arch_local_log;
+
+
+五、
+   -- 输出报告的脚本report.sh, 本例放在归档调度数据库服务器上的crontab里面.
+#!/bin/bash
+# PATH中必须包含mutt, psql等用到的命令.
+. ~/.bash_profile
+
+# 多个邮件用空格隔开
+EMAIL="digoal@126.com"
+
+echo -e `date +%F\ %T` >/tmp/report_archive.log
+echo -e /tmp/report_archive.log >>/tmp/report_archive_history.log
+
+echo -e "1. Summary Report:\n" >>/tmp/report_archive.log
+psql -h 127.0.0.1 arch arch -c "select t3.storage_nodes_cnt,t4.db_nodes_cnt,round(t1.total_size_gb,0) total_size_gb,round(t2.used_size_gb) used_size_gb,trunc((t2.used_size_gb/t1.total_size_gb)*100,2)||'%' USED_RATIO from 
+(select sum(size_mb)/1024 total_size_gb from arch_path_info) t1,
+(select sum(wal_size_mb)/1024 used_size_gb from arch_remote_log) t2,
+(select count(*) storage_nodes_cnt from arch_path_info) t3,
+(select count(*) db_nodes_cnt from arch_db_info) t4
+;" >>/tmp/report_archive.log
+
+echo -e "2. Weekly Report:\n" >>/tmp/report_archive.log
+psql -h 127.0.0.1 arch arch -c "select date(create_time),round(sum(wal_size_mb)/1024) size_gb from arch_remote_log where create_time >= current_date-7 and create_time<current_date group by date(create_time) order by date(create_time);" >>/tmp/report_archive.log
+
+echo -e "3. Abnormal Report:\n" >>/tmp/report_archive.log
+psql -h 127.0.0.1 arch arch -c "select db_id,ssh_ip,ssh_port,ssh_user,wal_size_mb,create_time,full_path from arch_remote_log where create_time>=current_date-1 and status is false order by create_time;" >>/tmp/report_archive.log
+
+echo -e "4. Local Report:\n" >>/tmp/report_archive.log
+psql -h 127.0.0.1 arch arch -c "select db_id,wal_size_mb,create_time,status,full_path from arch_local_log;" >>/tmp/report_archive.log
+
+cat /tmp/report_archive.log|mutt -s "`date +$F` SanDun Storage Cloud Report" $EMAIL
+
+
+
+
+六、
+   -- nagios 脚本 /usr/local/nagios/libexec/check_postgresql.sh
+   -- 部署在PostgreSQL客户机上. 由nrpe调用.\
+
+关于归档状态的监控采用nagios来搞定，如下是一个archive_command输出的文件内容范例:
+cat /tmp/pgarchive.nagios_5432
+0
+status=0,success.remote
+2011-07-0113:09:14
+第一行是归档状态，在归档命令里面定义。后面的是详细信息。根据第一行的值判断应该返回给NAGIOS什么值。
+nagios脚本的返回值0表示success,1表示warnning,2表示critical,3表示unknown.
+# 下面是归档命令里面定义的返回值
+# NAGIOS返回值 0 status=0,success.remote
+# NAGIOS返回值 1 status=1,success.local
+# NAGIOS返回值 1 status=2,handwork_pause_can_continue_at_this_point.remote and local
+# NAGIOS返回值 2 status=2,failed_can_continue_at_this_point.remote and local
+# NAGIOS返回值 2 status=3,handwork_stop_can_not_continue_at_this_point.remote and local
+# NAGIOS返回值 2 status=4,switch_check_unknown_can_continue_at_this_point.remote and local
+# NAGIOS返回值 2 错误消息
+
+# 所以可以写一个脚本供nrpe调用.
+
+vi /usr/local/nagios/libexec/check_postgresql.sh
+chmod 555 /usr/local/nagios/libexec/check_postgresql.sh
+
+#!/bin/bash
+
+if [ $# -ne 2 ]; then
+echo -e "Usage : $prog \$1 \$2 "
+exit 2
+fi
+
+DB_PORT=$2
+
+# 监控数据库是否开启, 未开启表示集群已切换, 返回值0
+nohup echo -e "q"|telnet -e "q" 127.0.0.1 $DB_PORT >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+echo -e "`date +%F%T`\nPostgreSQL -p $DB_PORT not run in this node"
+exit 0
+fi
+
+# 检查归档输出日志
+check_archive()
+{
+test -f /tmp/pgarchive.nagios_$DB_PORT
+if [ $? -ne 0 ]; then
+RESULT=2
+MESSAGE="`date +%F%T`\n/tmp/pgarchive.nagios_$DB_PORT not exist."
+echo -e $MESSAGE
+return $RESULT
+fi
+
+find /tmp/pgarchive.nagios_$DB_PORT -mmin -45|grep "pgarchive.nagios_$DB_PORT"
+if [ $? -ne 0 ]; then
+RESULT=2
+MESSAGE="`date +%F%T`\nPostgreSQL -p $DB_PORT archive timeout."
+echo -e $MESSAGE
+return $RESULT
+fi
+
+RESULT=`head -n 1 /tmp/pgarchive.nagios_$DB_PORT`
+cat /tmp/pgarchive.nagios_$DB_PORT
+return $RESULT
+}
+
+# See how we were called.
+case "$1" in
+  check_archive)
+        check_archive
+        ;;
+  *)
+        echo $"Usage: $prog {check_archive} port"
+        exit 1
+esac
+
+# NAGIOS返回值 0 status=0,success.remote
+# NAGIOS返回值 1 status=1,success.local
+# NAGIOS返回值 1 status=2,handwork_pause_can_continue_at_this_point.remote and local
+# NAGIOS返回值 2 status=2,failed_can_continue_at_this_point.remote and local
+# NAGIOS返回值 2 status=3,handwork_stop_can_not_continue_at_this_point.remote and local
+# NAGIOS返回值 2 status=4,switch_check_unknown_can_continue_at_this_point.remote and local
+# NAGIOS返回值 2 错误消息
+
+
+
+
+配置/usr/local/nagios/etc/nrpe.cfg
+vi /usr/local/nagios/etc/nrpe.cfg
+command[check_postgresql1]=/usr/local/nagios/libexec/check_postgresql.sh check_archive 5432 2>&1 | tee -a /tmp/check_postgresql.log
+command[check_postgresql2]=/usr/local/nagios/libexec/check_postgresql.sh check_archive 5433 2>&1 | tee -a /tmp/check_postgresql.log
+
+重启xinetd服务
+service xinetd restart
+
+
+在nagios服务端添加监控项 check_postgresql1,  check_postgresql2
+
+
+#Author : Digoal zhou
+#Email : digoal@126.com
+#Blog : http://blog.163.com/digoal@126/

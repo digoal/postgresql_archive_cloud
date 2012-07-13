@@ -1,0 +1,3 @@
+192.168.1.61:5432:arch:arch:digoal_archive_pwd
+127.0.0.1:5432:fingerprint:fingerprint:digoal_fingerprint_pwd
+127.0.0.1:5433:fingerprint:fingerprint:digoal_fingerprint_pwd

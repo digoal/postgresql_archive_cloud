@@ -1,0 +1,104 @@
+一、配置生产数据库指纹
+
+1. 使用LINUX命令uuidgen产生备份数据库指纹,放在本地fingerprint库,后面将用到录入arch_metadata库.
+create role fingerprint nosuperuser nocreatedb nocreaterole noinherit login encrypted password '密码略';
+create database fingerprint with owner fingerprint template template0 encoding 'UTF8' ;
+\c fingerprint fingerprint
+create schema fingerprint authorization fingerprint;
+create table fingerprint (id int ,uuid text not null,wal_size_bytes bigint not null,create_time timestamp without time zone,primary key (id));
+postgres@db-172-16-3-33-> uuidgen 
+1737cd35-f1fd-4481-a4fe-34f606cb96a1
+psql -h 127.0.0.1 fingerprint fingerprint -c "insert into fingerprint values (1,'1737cd35-f1fd-4481-a4fe-34f606cb96a1',67108864,now());"
+
+二、配置备份调度数据库
+2. arch_db_info
+create table arch_db_info (id uuid,idc text,platform text,software text,version text,vip inet,port int,switch text,create_time timestamp without time zone,modify_time timestamp without time zone,active_status boolean,primary key (id));
+create unique index uk_db_info_1 on arch_db_info (idc,vip,port);
+
+3. arch_path_info
+create table arch_path_info (id int,ssh_ip inet,ssh_port int,ssh_user text,root_path text,create_time timestamp without time zone,modify_time timestamp without time zone,active_status boolean,primary key (id));
+create unique index uk_path_info_1 on arch_path_info (ssh_ip,ssh_port,root_path);
+
+4. arch_path_map(允许一个db_id对应多个路径,用于冗余链路选择)
+create table arch_path_map (id int,db_id uuid,path_id int,priority int,active_status boolean,create_time timestamp without time zone,modify_time timestamp without time zone,primary key (id));
+create unique index uk_path_map_1 on arch_path_map (db_id,path_id);
+alter table arch_path_map add constraint fk_path_1 foreign key (db_id) references arch_db_info(id);
+alter table arch_path_map add constraint fk_path_2 foreign key (path_id) references arch_path_info(id);
+
+5. arch_remote_log
+create table arch_remote_log (db_id uuid,ssh_ip inet,ssh_port int,ssh_user text,full_path text,wal_size_bytes bigint,create_time timestamp without time zone,status boolean);
+
+6. arch_local_log
+create table arch_local_log (db_id uuid,full_path text,wal_size_bytes bigint,create_time timestamp without time zone,status boolean);
+
+7. 收集生产库指纹,录入归档调度数据库
+insert into arch_db_info (id,idc,platform,software,version,vip,port,create_time,active_status,switch) values ('09e9f16f-ad78-4c89-bedd-37aab5477d68','HangZhouSanDun','x86_64','PostgreSQL','9.0.4','192.168.1.216','5432',now(),'true','start');
+
+三、配置备份存储服务器目录结构以及权限
+mkdir /data1
+pvcreate 
+vgcreate
+lvcreate
+mkfs.ext4
+vi /etc/fstab
+noatime
+mount -a
+useradd arch
+passwd arch
+chown -R arch:arch /data1
+chmod -R 700 /data1
+su - arch
+mkdir /data1/arch1
+mkdir /data1/arch2
+mkdir /data1/arch3
+mkdir /data1/arch4
+# 生产环境的话,这几个目录应挂着在不同的存储下面,不同的SAN,不同的磁盘组,不同的服务器
+
+四、录入备份存储信息及映射关系至归档调度数据库
+1. 配置存储目录信息
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (1,'172.16.3.176',20100,'postgres','/data1/arch1/',now(),'true');
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (2,'172.16.3.176',20100,'postgres','/data1/arch2/',now(),'true');
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (3,'172.16.3.176',20100,'postgres','/data1/arch3/',now(),'true');
+insert into arch_path_info (id,ssh_ip,ssh_port,ssh_user,root_path,create_time,active_status) values (4,'172.16.3.176',20100,'postgres','/data1/arch4/',now(),'true');
+
+2. 配置备份映射信息
+insert into arch_path_map (id,db_id,path_id,priority,active_status,create_time) values (1,'1737cd35-f1fd-4481-a4fe-34f606cb96a1','1',1,'true',now());
+insert into arch_path_map (id,db_id,path_id,priority,active_status,create_time) values (2,'1737cd35-f1fd-4481-a4fe-34f606cb96a1','2',2,'true',now());
+insert into arch_path_map (id,db_id,path_id,priority,active_status,create_time) values (3,'1737cd35-f1fd-4481-a4fe-34f606cb96a1','3',3,'true',now());
+insert into arch_path_map (id,db_id,path_id,priority,active_status,create_time) values (4,'1737cd35-f1fd-4481-a4fe-34f606cb96a1','4',4,'true',now());
+
+五、配置信任关系
+1. ssh-keygen -t dsa
+   ssh-keygen -t rsa
+   生产数据库的系统用户postgres无需密码连接到归档存储服务器arch用户.
+   ssh arch@$IP date
+   ssh postgres@$IP date
+2. 配置ssh/sshd_config ssh/ssh_config
+   usedns , GSSAPI
+
+六、配置本地归档目录
+准备环境 : 
+本地归档目录
+LOC_ARCH=/local_data/arch/
+目录权限
+postgres:postgres 700
+
+
+七、配置脚本目录
+$POSTGRES_USER_HOME/arch_script
+chmod 700 
+
+
+八、配置postgresql.conf
+archive_command = '. ~/arch_script/pg_archive.sh %p %f'
+pg_ctl reload -D $PGDATA
+
+久、测试
+
+十、调表字段,调整存储优先级,以便备份脚本选择优先级高的存储存放归档.
+    调整开关存储路径或映射路径,以调整是否使用该路径.
+
+
+Author : Digoal zhou
+Email : digoal@126.com
+Blog : http://blog.163.com/digoal@126/
